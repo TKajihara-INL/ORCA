@@ -1,3 +1,8 @@
+import time
+from typing import Callable, Optional
+
+import numpy as np
+
 class Optimization(object):
     """
     MPC dispatch optimization.
@@ -176,3 +181,228 @@ class Optimization(object):
                 result["measurements"].append(0.0)
 
         return result
+
+
+def clip_and_integrate_action(
+    current_values,
+    raw_action,
+    bounds=None,
+    delta_limits=None,
+):
+    """
+    Generic helper to clip action deltas and integrate them into bounded setpoints.
+
+    Parameters
+    ----------
+    current_values : sequence of float
+        Current setpoint values (length = n).
+    raw_action : sequence of float
+        Policy output (deltas) with the same length as `current_values`.
+    bounds : sequence of (low, high) or single (low, high), optional
+        Per-dimension bounds. A single tuple applies to all dimensions.
+        Defaults to unbounded if not provided.
+    delta_limits : float or sequence of float, optional
+        Maximum absolute delta per dimension. A scalar applies to all dims.
+        Defaults to np.inf (no per-step limit) if not provided.
+    """
+    curr = np.asarray(current_values, dtype=float).reshape(-1)
+    action = np.asarray(raw_action, dtype=float).reshape(-1)
+    if action.size != curr.size:
+        raise ValueError("raw_action must have the same length as current_values")
+
+    n = curr.size
+    if bounds is None:
+        bounds = [(float("-inf"), float("inf"))] * n
+    elif isinstance(bounds, tuple) and len(bounds) == 2 and not isinstance(
+        bounds[0], (list, tuple)
+    ):
+        bounds = [bounds] * n
+    if len(bounds) != n:
+        raise ValueError("bounds must match the length of current_values")
+
+    lows = np.array([float(b[0]) for b in bounds], dtype=float)
+    highs = np.array([float(b[1]) for b in bounds], dtype=float)
+
+    limits = np.asarray(delta_limits if delta_limits is not None else np.inf, dtype=float).reshape(-1)
+    if limits.size == 1:
+        limits = np.full(n, limits.item(), dtype=float)
+    if limits.size != n:
+        raise ValueError("delta_limits must be scalar or match the length of current_values")
+
+    deltas = np.clip(action, -limits, limits)
+    new_values = np.clip(curr + deltas, lows, highs)
+    return deltas, new_values
+
+
+def bounded_action_update(
+    voltage: float,
+    temperature: float,
+    raw_action,
+    voltage_bounds=(0.0, float("inf")),
+    temp_bounds=(0.0, float("inf")),
+    dv_limit: float = 0.5,
+    dt_limit: float = 5.0,
+):
+    """
+    Backward-compatible 2D helper for voltage/temperature control.
+    Prefer `clip_and_integrate_action` for new use cases.
+    """
+    deltas, new_values = clip_and_integrate_action(
+        current_values=[voltage, temperature],
+        raw_action=raw_action,
+        bounds=[voltage_bounds, temp_bounds],
+        delta_limits=[dv_limit, dt_limit],
+    )
+    return float(deltas[0]), float(deltas[1]), float(new_values[0]), float(new_values[1])
+
+
+class RLSetpointController:
+    """
+    Generic policy wrapper to apply bounded setpoint deltas.
+
+    - Works with any number of setpoints.
+    - Keeps backward compatibility with the voltage/temperature workflow.
+    """
+
+    def __init__(
+        self,
+        policy_fn: Callable,
+        setpoint_names=None,
+        init_setpoints=None,
+        bounds=None,
+        delta_limits=None,
+        obs_builder: Optional[Callable] = None,
+        init_voltage: float = 0.0,
+        init_temperature: float = 0.0,
+        dv_limit: float = 0.5,
+        dt_limit: float = 5.0,
+        voltage_bounds=(0.0, float("inf")),
+        temp_bounds=(0.0, float("inf")),
+    ):
+        self.policy_fn = policy_fn
+        self.obs_builder = obs_builder
+
+        base_setpoints = (
+            [init_voltage, init_temperature] if init_setpoints is None else init_setpoints
+        )
+        self.setpoints = np.asarray(base_setpoints, dtype=float).reshape(-1)
+        if self.setpoints.size == 0:
+            raise ValueError("init_setpoints must contain at least one value")
+
+        n = self.setpoints.size
+        if setpoint_names is None:
+            setpoint_names = ["voltage", "temperature"] if n == 2 else [f"setpoint_{i}" for i in range(n)]
+        if len(setpoint_names) != n:
+            raise ValueError("setpoint_names must match the number of setpoints")
+        self.setpoint_names = list(setpoint_names)
+
+        if bounds is None:
+            if n == 2:
+                bounds = [voltage_bounds, temp_bounds]
+            else:
+                bounds = [(float("-inf"), float("inf"))] * n
+        if len(bounds) != n:
+            raise ValueError("bounds must match the number of setpoints")
+        self.bounds = [(float(b[0]), float(b[1])) for b in bounds]
+        self._bounds_low = np.array([b[0] for b in self.bounds], dtype=float)
+        self._bounds_high = np.array([b[1] for b in self.bounds], dtype=float)
+
+        if delta_limits is None:
+            if n == 2:
+                delta_limits = [dv_limit, dt_limit]
+            else:
+                delta_limits = [np.inf] * n
+        delta_arr = np.asarray(delta_limits, dtype=float).reshape(-1)
+        if delta_arr.size == 1:
+            delta_arr = np.full(n, delta_arr.item(), dtype=float)
+        if delta_arr.size != n:
+            raise ValueError("delta_limits must be scalar or match the number of setpoints")
+        self.delta_limits = delta_arr
+
+        self.history = []
+        self.reset(*self.setpoints.tolist())
+
+    def reset(self, *setpoint_values) -> None:
+        """
+        Reset internal setpoints.
+        - Pass a sequence or individual values matching the controller dimension.
+        - If called with no arguments, uses the current setpoints.
+        """
+        if len(setpoint_values) == 0:
+            values = self.setpoints
+        elif len(setpoint_values) == 1 and not isinstance(setpoint_values[0], (int, float)):
+            values = np.asarray(setpoint_values[0], dtype=float).reshape(-1)
+        else:
+            values = np.asarray(setpoint_values, dtype=float).reshape(-1)
+
+        if values.size != self.setpoints.size:
+            raise ValueError("reset values must match the number of setpoints")
+        self.setpoints = np.clip(values, self._bounds_low, self._bounds_high)
+        self.history = []
+
+    def _build_observation(
+        self,
+        measured_current: Optional[float],
+        target_current: Optional[float],
+        observation,
+    ) -> np.ndarray:
+        if observation is not None:
+            return np.asarray(observation, dtype=np.float32)
+        if self.obs_builder is not None:
+            return np.asarray(self.obs_builder(measured_current, target_current), dtype=np.float32)
+        if measured_current is None or target_current is None:
+            raise ValueError("Provide observation or (measured_current, target_current)")
+        return np.array([measured_current, target_current], dtype=np.float32)
+
+    def step(
+        self,
+        measured_current: Optional[float] = None,
+        target_current: Optional[float] = None,
+        timestamp: Optional[float] = None,
+        observation=None,
+    ):
+        deltas, new_setpoints, raw_action, entry = self.step_vector(
+            measured_current=measured_current,
+            target_current=target_current,
+            timestamp=timestamp,
+            observation=observation,
+        )
+        if new_setpoints.size >= 2:
+            return deltas, float(new_setpoints[0]), float(new_setpoints[1]), raw_action, entry
+        if new_setpoints.size == 1:
+            return deltas, float(new_setpoints[0]), None, raw_action, entry
+        return deltas, None, None, raw_action, entry
+
+    def step_vector(
+        self,
+        measured_current: Optional[float] = None,
+        target_current: Optional[float] = None,
+        timestamp: Optional[float] = None,
+        observation=None,
+    ):
+        obs = self._build_observation(measured_current, target_current, observation)
+        raw_action = np.asarray(self.policy_fn(obs), dtype=np.float32)
+        deltas, new_setpoints = clip_and_integrate_action(
+            current_values=self.setpoints,
+            raw_action=raw_action,
+            bounds=self.bounds,
+            delta_limits=self.delta_limits,
+        )
+
+        self.setpoints = new_setpoints
+
+        entry = {
+            "timestamp": time.time() if timestamp is None else timestamp,
+            "observation": obs.tolist(),
+            "raw_action": raw_action.tolist(),
+            "deltas": deltas.tolist(),
+            "setpoints": new_setpoints.tolist(),
+            "measured_current": None if measured_current is None else float(measured_current),
+            "target_current": None if target_current is None else float(target_current),
+        }
+        for name, delta, sp in zip(self.setpoint_names, deltas, new_setpoints):
+            entry[f"{name}_delta"] = float(delta)
+            entry[f"{name}_command"] = float(sp)
+
+        self.history.append(entry)
+        return deltas, new_setpoints, raw_action, entry
