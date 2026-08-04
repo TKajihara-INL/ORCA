@@ -9,6 +9,8 @@ This Python package performs dispatch optimization for real-time economic optimi
 
 ## Installation
 
+ORCA requires Python 3.10 or newer.
+
 Clone the repository, navigate to the directory containing setup.py and execute:
 ```
 pip install -e .
